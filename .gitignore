@@ -1,0 +1,14 @@
+__pycache__/
+*.py[codz]
+.env
+.venv
+env/
+venv/
+*.csv
+*.txt
+!requirements.txt
+raw_data/
+output/
+.DS_Store
+.claude/
+.ruff_cache/

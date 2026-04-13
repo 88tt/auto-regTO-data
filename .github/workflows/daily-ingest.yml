@@ -1,0 +1,221 @@
+name: Daily Ingest - Registered Programs
+
+# Scheduled runs use this workflow file from the default branch only (GitHub requirement).
+on:
+  schedule:
+    # 09:30 Toronto during EDT (Mar–Nov): 13:30 UTC. Winter EST: use "30 14 * * *" instead.
+    - cron: "30 13 * * *"
+  workflow_dispatch:
+    inputs:
+      year_and_season:
+        description: "Season identifier (e.g. 2026s2To)"
+        required: false
+        default: "2026s2To"
+      export_only:
+        description: "Skip scrape + insert; export from DB only"
+        type: boolean
+        default: false
+
+env:
+  # Documented pattern for workflow_dispatch + schedule (inputs empty on schedule).
+  YEAR_AND_SEASON: ${{ github.event.inputs.year_and_season || '2026s2To' }}
+  STARTDATE_CUTOFF: "2026-03-01"
+  CITY: "To"
+  CHROME_HEADLESS: "1"
+  PYTHONUNBUFFERED: "1"
+  TARGET_BRANCH: "data/registered-programs"  # merged to main manually when ready for prod
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.export_only != 'true' }}
+    strategy:
+      fail-fast: false  # let other groups continue if one fails
+      matrix:
+        include:
+          - group: group-a
+            activities: "Swim,Skate - ,Ski/Snowboard - "
+          - group: group-b
+            activities: "Sports -,Hobbies,Arts -,Leadership"
+          - group: group-c
+            activities: "CampTO,Early Years,FitnessTO,After School,Adapted Activities"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.2.2
+
+      - name: Set up Python
+        uses: actions/setup-python@v5.4.0
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Scrape (${{ matrix.group }})
+        env:
+          ACTIVITIES: ${{ matrix.activities }}
+        run: python 1_scrape_w_selenium.py
+
+      - name: Upload raw data (${{ matrix.group }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: raw-data-${{ matrix.group }}
+          path: raw_data/
+
+  insert:
+    runs-on: ubuntu-latest
+    needs: scrape
+    if: ${{ github.event.inputs.export_only != 'true' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.2.2
+
+      - name: Set up Python
+        uses: actions/setup-python@v5.4.0
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download all raw data
+        uses: actions/download-artifact@v4
+        with:
+          pattern: raw-data-*
+          path: raw_data/
+          merge-multiple: true
+
+      # Re-run clean per group to regenerate dfcrs.csv from merged raw data, then insert sequentially.
+      - name: Clean + Insert group-a
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          GOOGLE_MAP_API_KEY: ${{ secrets.GOOGLE_MAP_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ACTIVITIES: "Swim,Skate - ,Ski/Snowboard - "
+        run: python 2_clean_data.py && python 3_insert_to_db.py
+
+      - name: Clean + Insert group-b
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          GOOGLE_MAP_API_KEY: ${{ secrets.GOOGLE_MAP_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ACTIVITIES: "Sports -,Hobbies,Arts -,Leadership"
+        run: python 2_clean_data.py && python 3_insert_to_db.py
+
+      - name: Clean + Insert group-c
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          GOOGLE_MAP_API_KEY: ${{ secrets.GOOGLE_MAP_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ACTIVITIES: "CampTO,Early Years,FitnessTO,After School,Adapted Activities"
+        run: python 2_clean_data.py && python 3_insert_to_db.py
+
+      - name: Generate combined dfcrs.csv (all activities)
+        run: python 2_clean_data.py
+        # No ACTIVITIES set — defaults to all activities, writes combined dfcrs.csv
+
+      - name: Upload combined dfcrs
+        uses: actions/upload-artifact@v4
+        with:
+          name: dfcrs-combined
+          path: raw_data/
+
+  export:
+    runs-on: ubuntu-latest
+    needs: [scrape, insert]
+    if: always() && (needs.insert.result == 'success' || needs.insert.result == 'skipped')
+
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4.2.2
+
+      - name: Checkout target (${{ env.TARGET_BRANCH }})
+        uses: actions/checkout@v4.2.2
+        with:
+          repository: ${{ secrets.TARGET_REPO }}
+          ref: ${{ env.TARGET_BRANCH }}
+          path: target
+          token: ${{ secrets.TARGET_REPO_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5.4.0
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download combined dfcrs
+        if: ${{ github.event.inputs.export_only != 'true' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: dfcrs-combined
+          path: raw_data/
+
+      - name: Export JSON to target
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          OUT_DIR: ${{ github.workspace }}/target/public/data
+          SCRAPE_RUN: scraped${{ github.run_id }}
+          EXPORT_LATEST_SCRAPE_ONLY: "1"
+        run: python 4_db_to_json.py
+
+      - name: Validate output files
+        run: |
+          python - <<'EOF'
+          import glob, json, os, sys
+
+          season = os.environ["YEAR_AND_SEASON"]
+          data_dir = "target/public/data"
+
+          # Only validate sport-season files — pattern-matched, not skip-listed.
+          sport_files = sorted(glob.glob(os.path.join(data_dir, f"*_{season}.json")))
+
+          errors = []
+          if not sport_files:
+              errors.append(f"No sport JSON files found matching *_{season}.json under {data_dir}")
+
+          non_empty = 0
+          for path in sport_files:
+              try:
+                  data = json.load(open(path))
+                  if not isinstance(data, dict) or "sessionsWithCourses" not in data:
+                      errors.append(f"{path}: unexpected format (expected dict with sessionsWithCourses)")
+                      continue
+                  count = len(data["sessionsWithCourses"])
+                  status = f"{count} sessions" if count > 0 else "empty"
+                  print(f"{os.path.relpath(path)}: {status}")
+                  if count > 0:
+                      non_empty += 1
+              except json.JSONDecodeError as e:
+                  errors.append(f"{path}: invalid JSON — {e}")
+
+          if sport_files and non_empty == 0:
+              errors.append("All sport files are empty — scrape likely failed")
+
+          if errors:
+              print("\nVALIDATION FAILED:")
+              for e in errors:
+                  print(f"  - {e}")
+              sys.exit(1)
+
+          print(f"\n{non_empty}/{len(sport_files)} files have data")
+          EOF
+
+      - name: Commit and push to target
+        working-directory: target
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add public/data/
+          if git diff --cached --quiet; then
+            echo "No changes to public data — skipping commit"
+          else
+            git commit -m "chore: update programs data $(date -u +%Y-%m-%d)"
+            git push
+          fi
